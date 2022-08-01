@@ -40,6 +40,7 @@ import jdk.internal.foreign.abi.SharedUtils;
 import jdk.internal.foreign.abi.VMStorage;
 import jdk.internal.foreign.abi.aarch64.linux.LinuxAArch64CallArranger;
 import jdk.internal.foreign.abi.aarch64.macos.MacOsAArch64CallArranger;
+import jdk.internal.foreign.abi.aarch64.windows.WindowsAArch64CallArranger;
 import jdk.internal.foreign.Utils;
 
 import java.lang.foreign.MemorySession;
@@ -60,7 +61,7 @@ import static jdk.internal.foreign.abi.aarch64.AArch64Architecture.Regs.*;
  *
  * There are minor differences between the ABIs implemented on Linux, macOS, and Windows
  * which are handled in sub-classes. Clients should access these through the provided
- * public constants CallArranger.LINUX and CallArranger.MACOS.
+ * public constants CallArranger.LINUX, CallArranger.MACOS, and CallArranger.WINDOWS.
  */
 public abstract class CallArranger {
     private static final int STACK_SLOT_SIZE = 8;
@@ -79,7 +80,7 @@ public abstract class CallArranger {
     // Although the AAPCS64 says r0-7 and v0-7 are all valid return
     // registers, it's not possible to generate a C function that uses
     // r2-7 and v4-7 so they are omitted here.
-    private static final ABIDescriptor C = abiFor(
+    protected static final ABIDescriptor C = abiFor(
         new VMStorage[] { r0, r1, r2, r3, r4, r5, r6, r7, INDIRECT_RESULT},
         new VMStorage[] { v0, v1, v2, v3, v4, v5, v6, v7 },
         new VMStorage[] { r0, r1 },
@@ -98,6 +99,7 @@ public abstract class CallArranger {
 
     public static final CallArranger LINUX = new LinuxAArch64CallArranger();
     public static final CallArranger MACOS = new MacOsAArch64CallArranger();
+    public static final CallArranger WINDOWS = new WindowsAArch64CallArranger();
 
     /**
      * Are variadic arguments assigned to registers as in the standard calling
@@ -112,6 +114,23 @@ public abstract class CallArranger {
      */
     protected abstract boolean requiresSubSlotStackPacking();
 
+    /**
+     * Are floating point arguments to variadic functions passed in general purpose registers
+     * instead of floating point registers?
+     *
+     * {@return true if this ABI uses general purpose registers for variadic floating point arguments.}
+     */
+    protected abstract boolean useIntRegsForVariadicFloatingPointArgs();
+
+    /**
+     * @return The ABIDescriptor used by the CallArranger for the current platform.
+     */
+    protected abstract ABIDescriptor abiDescriptor();
+
+    protected TypeClass getArgumentClassForBindings(MemoryLayout layout, boolean forVariadicFunction) {
+        return TypeClass.classifyLayout(layout);
+    }
+
     protected CallArranger() {}
 
     public Bindings getBindings(MethodType mt, FunctionDescriptor cDesc, boolean forUpcall) {
@@ -119,10 +138,12 @@ public abstract class CallArranger {
     }
 
     public Bindings getBindings(MethodType mt, FunctionDescriptor cDesc, boolean forUpcall, LinkerOptions options) {
-        CallingSequenceBuilder csb = new CallingSequenceBuilder(C, forUpcall, options);
+        CallingSequenceBuilder csb = new CallingSequenceBuilder(abiDescriptor(), forUpcall, options);
 
-        BindingCalculator argCalc = forUpcall ? new BoxBindingCalculator(true) : new UnboxBindingCalculator(true);
-        BindingCalculator retCalc = forUpcall ? new UnboxBindingCalculator(false) : new BoxBindingCalculator(false);
+        boolean forVariadicFunction = options.isVariadicFunction();
+
+        BindingCalculator argCalc = forUpcall ? new BoxBindingCalculator(true) : new UnboxBindingCalculator(true, forVariadicFunction);
+        BindingCalculator retCalc = forUpcall ? new UnboxBindingCalculator(false, forVariadicFunction) : new BoxBindingCalculator(false);
 
         boolean returnInMemory = isInMemoryReturn(cDesc.returnLayout());
         if (returnInMemory) {
@@ -149,7 +170,7 @@ public abstract class CallArranger {
     public MethodHandle arrangeDowncall(MethodType mt, FunctionDescriptor cDesc, LinkerOptions options) {
         Bindings bindings = getBindings(mt, cDesc, false, options);
 
-        MethodHandle handle = new DowncallLinker(C, bindings.callingSequence).getBoundMethodHandle();
+        MethodHandle handle = new DowncallLinker(abiDescriptor(), bindings.callingSequence).getBoundMethodHandle();
 
         if (bindings.isInMemoryReturn) {
             handle = SharedUtils.adaptDowncallForIMR(handle, cDesc);
@@ -165,7 +186,7 @@ public abstract class CallArranger {
             target = SharedUtils.adaptUpcallForIMR(target, true /* drop return, since we don't have bindings for it */);
         }
 
-        return UpcallLinker.make(C, target, bindings.callingSequence, session);
+        return UpcallLinker.make(abiDescriptor(), target, bindings.callingSequence, session);
     }
 
     private static boolean isInMemoryReturn(Optional<MemoryLayout> returnLayout) {
@@ -212,8 +233,9 @@ public abstract class CallArranger {
 
         VMStorage[] regAlloc(int type, int count) {
             if (nRegs[type] + count <= MAX_REGISTER_ARGUMENTS) {
+                ABIDescriptor abiDescriptor = abiDescriptor();
                 VMStorage[] source =
-                    (forArguments ? C.inputStorage : C.outputStorage)[type];
+                    (forArguments ? abiDescriptor.inputStorage : abiDescriptor.outputStorage)[type];
                 VMStorage[] result = new VMStorage[count];
                 for (int i = 0; i < count; i++) {
                     result[i] = source[nRegs[type]++];
@@ -334,8 +356,13 @@ public abstract class CallArranger {
     }
 
     class UnboxBindingCalculator extends BindingCalculator {
-        UnboxBindingCalculator(boolean forArguments) {
+        protected final boolean forArguments;
+        protected final boolean forVariadicFunction;
+
+        UnboxBindingCalculator(boolean forArguments, boolean forVariadicFunction) {
             super(forArguments);
+            this.forArguments = forArguments;
+            this.forVariadicFunction = forVariadicFunction;
         }
 
         @Override
@@ -348,8 +375,11 @@ public abstract class CallArranger {
 
         @Override
         List<Binding> getBindings(Class<?> carrier, MemoryLayout layout) {
-            TypeClass argumentClass = TypeClass.classifyLayout(layout);
+            TypeClass argumentClass = getArgumentClassForBindings(layout, forVariadicFunction);
             Binding.Builder bindings = Binding.builder();
+
+            boolean useIntRegsForFloatingPointArgs = forArguments && forVariadicFunction && useIntRegsForVariadicFloatingPointArgs();
+
             switch (argumentClass) {
                 case STRUCT_REGISTER: {
                     assert carrier == MemorySegment.class;
@@ -361,7 +391,7 @@ public abstract class CallArranger {
                         while (offset < layout.byteSize()) {
                             final long copy = Math.min(layout.byteSize() - offset, 8);
                             VMStorage storage = regs[regIndex++];
-                            boolean useFloat = storage.type() == StorageType.VECTOR;
+                            boolean useFloat = (!useIntRegsForFloatingPointArgs) && storage.type() == StorageType.VECTOR;
                             Class<?> type = SharedUtils.primitiveCarrierForSize(copy, useFloat);
                             if (offset + copy < layout.byteSize()) {
                                 bindings.dup();
@@ -421,8 +451,9 @@ public abstract class CallArranger {
                     break;
                 }
                 case FLOAT: {
+                    int type = useIntRegsForFloatingPointArgs ? StorageType.INTEGER : StorageType.VECTOR;
                     VMStorage storage =
-                        storageCalculator.nextStorage(StorageType.VECTOR, layout);
+                        storageCalculator.nextStorage(type, layout);
                     bindings.vmStore(storage, carrier);
                     break;
                 }
